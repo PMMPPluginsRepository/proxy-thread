@@ -1,0 +1,6 @@
+name: proxy-thread
+antigen: skh6075\lib\proxythread
+api: 4.0.0
+version: 1.0.0
+author: skh6075
+description: Proxy with server socket handling
