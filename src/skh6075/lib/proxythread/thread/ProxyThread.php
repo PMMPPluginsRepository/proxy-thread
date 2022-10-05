@@ -4,98 +4,105 @@ declare(strict_types=1);
 
 namespace skh6075\lib\proxythread\thread;
 
-use ArrayIterator;
-use JetBrains\PhpStorm\Pure;
+use InvalidArgumentException;
 use pocketmine\thread\ThreadException;
-use skh6075\lib\proxythread\event\ProxyReceiveDataEvent;
-use skh6075\lib\proxythread\event\ProxySendDataEvent;
 use skh6075\lib\proxythread\proxy\Proxy;
 use Socket;
 use Thread;
 use Volatile;
-use function socket_create;
-use function socket_set_nonblock;
-use function socket_bind;
-use function socket_close;
-use function socket_sendto;
-use function socket_read;
+use function is_array;
 use function json_decode;
 use function json_encode;
-use function is_string;
-use function is_array;
+use function socket_bind;
+use function socket_close;
+use function socket_create;
+use function socket_sendto;
+use function socket_set_nonblock;
 
-class ProxyThread extends Thread{
+final class ProxyThread extends Thread{
 	public const KEY_IDENTIFY = "identify";
 	public const KEY_DATA = "data";
 
-	private bool $shutdown = true;
+	private bool $shutdown = false;
 
 	private Volatile $sendQueue;
+	private Volatile $receiveQueue;
 
-	#[Pure] public function __construct(
+	public function __construct(
 		private Proxy $proxy,
-		private int $bindPort,
-		?Volatile $sendQueue = null
+		private int $receivePort,
+		private Volatile $sendPorts, //multi-proxy-socket
+		?Volatile $sendQueue = null,
+		?Volatile $receiveQueue = null
 	){
 		$this->sendQueue = $sendQueue ?? new Volatile();
+		$this->receiveQueue = $receiveQueue ?? new Volatile();
 	}
 
-	public function shutdown(): void{
+	public function shutdown() : void{
 		$this->shutdown = true;
+	}
+
+	public function getReceiveQueue() : Volatile{
+		return $this->receiveQueue;
 	}
 
 	public function run(){
 		$receiveSocket = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
-		$sendSocket = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
-
 		socket_set_nonblock($receiveSocket);
 
-		if($receiveSocket === false || $sendSocket === false){
-			throw new ThreadException("Failed to create socket");
+		if($receiveSocket === false){
+			throw new InvalidArgumentException("Failed to create socket");
 		}
 
-		if(socket_bind($receiveSocket, "0.0.0.0", $this->bindPort) === false){
-			throw new ThreadException("Failed to bind port");
+		if(socket_bind($receiveSocket, "0.0.0.0", $this->receivePort) === false){
+			throw new InvalidArgumentException("Failed to bind port (bindPort: $this->receivePort)");
 		}
 
-		if(!$this->shutdown){
-			$this->sendData($sendSocket);
+		$sendSocket = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
+		if($sendSocket === false){
+			throw new InvalidArgumentException("Failed to create socket");
+		}
+
+		while(!$this->shutdown){
 			$this->receiveData($receiveSocket);
+
+			while($this->sendQueue->count() > 0){
+				$chunk = $this->sendQueue->shift();
+				if(!isset($chunk[self::KEY_IDENTIFY], $chunk[self::KEY_DATA])){
+					continue;
+				}
+
+				foreach((array) $this->sendPorts as $port){
+					socket_sendto($sendSocket, json_encode((array) $chunk), 65535, 0, $this->proxy->getAddress(), $port);
+				}
+			}
 		}
-		socket_close($receiveSocket);
 		socket_close($sendSocket);
+		socket_close($receiveSocket);
 	}
 
-	private function sendData(Socket $sendSocket): void{
-		while($this->sendQueue->count() > 0){
-			$chunk = $this->sendQueue->shift();
-			if(!isset($chunk[self::KEY_IDENTIFY], $chunk[self::KEY_DATA])){
-				continue;
+	private function receiveData(Socket $receiveSocket) : void{
+		$buffer = "";
+		if(socket_recvfrom($receiveSocket, $buffer, 65535, 0, $source, $port) === false){
+			$errno = socket_last_error($receiveSocket);
+			if($errno === SOCKET_EWOULDBLOCK){
+				return;
 			}
-
-			if(socket_sendto($sendSocket, json_encode($chunk), PHP_INT_MAX, 0, $this->proxy->getAddress(), $this->proxy->getPort()) === false){
-				continue;
-			}
-
-			(new ProxySendDataEvent($this->proxy, new ArrayIterator([
-				self::KEY_IDENTIFY => $chunk[self::KEY_IDENTIFY],
-				self::KEY_DATA => $chunk[self::KEY_DATA]
-			])))->call();
+			throw new ThreadException("Failed received");
 		}
-	}
 
-	private function receiveData(Socket $receiveSocket): void{
-		while(is_string(($row = socket_read($receiveSocket, PHP_INT_MAX)))){
-			$data = json_decode($row, true);
+		if($buffer !== null && $buffer !== ""){
+			$data = json_decode($buffer, true);
 			if(!is_array($data) || !isset($data[self::KEY_IDENTIFY], $data[self::KEY_DATA])){
-				continue;
+				return;
 			}
 
-			(new ProxyReceiveDataEvent($this->proxy, new ArrayIterator($data)))->call();
+			$this->receiveQueue[] = $data;
 		}
 	}
 
-	public function getSendQueue(): Volatile{
-		return $this->sendQueue;
+	public function send(array $data) : void{
+		$this->sendQueue[] = $data;
 	}
 }
